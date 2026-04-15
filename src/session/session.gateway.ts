@@ -20,6 +20,10 @@ import {
   PLAYER_ROLES,
   TIMER_TICK_INTERVAL_MS,
 } from './config/session.config';
+import {
+  getDifficultyConfig,
+  getExtraHintCostForDifficulty,
+} from './gameplay/config/difficulty.config';
 
 @WebSocketGateway({
   cors: {
@@ -377,9 +381,16 @@ export class SessionsGateway implements OnGatewayDisconnect {
         },
         analysteIds,
       );
+      const activeModuleIds = gameplayResult.solutionsDistribution.map(
+        (distribution) => distribution.moduleId,
+      );
+      const gameSession =
+        (await this.sessionService.updateSession(data.sessionCode, {
+          activeModuleIds,
+        })) ?? updatedSession;
 
       this.server.to(data.sessionCode).emit('gameStarted', {
-        session: updatedSession,
+        session: gameSession,
         moduleManuals: gameplayResult.moduleManuals,
         solutionsDistribution: gameplayResult.solutionsDistribution,
         solutionsByAnalyste: gameplayResult.solutionsByAnalyste,
@@ -504,6 +515,221 @@ export class SessionsGateway implements OnGatewayDisconnect {
     }
 
     await this.stopGameTimer(data.sessionCode);
+    return { success: true };
+  }
+
+  @SubscribeMessage('requestExtraHint')
+  async handleRequestExtraHint(
+    @MessageBody()
+    data: {
+      sessionCode: string;
+      moduleId: string;
+      hintIndex?: number;
+    },
+    @ConnectedSocket() client: Socket,
+  ) {
+    const session = await this.sessionService.getSession(data.sessionCode);
+    if (!session) {
+      return {
+        success: false,
+        message: `Session with code ${data.sessionCode} does not exist`,
+      };
+    }
+    if (session.agentId !== client.id) {
+      return {
+        success: false,
+        message: 'Only the agent can request an extra hint',
+      };
+    }
+    if (!session.started || !session.timerStarted) {
+      return {
+        success: false,
+        message: 'Game timer must be running to request an extra hint',
+      };
+    }
+    if (!data.moduleId) {
+      return {
+        success: false,
+        message: 'moduleId is required',
+      };
+    }
+
+    const moduleEntity =
+      (await this.moduleService.findOne(data.moduleId)) ??
+      (await this.moduleService.findOneByName(data.moduleId));
+    if (!moduleEntity) {
+      return {
+        success: false,
+        message: `Module ${data.moduleId} not found`,
+      };
+    }
+    const rawActiveModuleIds: unknown = (
+      session as Session & { activeModuleIds?: unknown }
+    ).activeModuleIds;
+    const activeModuleIds = Array.isArray(rawActiveModuleIds)
+      ? rawActiveModuleIds.filter(
+          (moduleId): moduleId is string => typeof moduleId === 'string',
+        )
+      : [];
+    const hasModuleInCurrentGame =
+      activeModuleIds.includes(data.moduleId) ||
+      activeModuleIds.includes(moduleEntity.name);
+    if (!hasModuleInCurrentGame) {
+      return {
+        success: false,
+        message: `Module ${data.moduleId} is not active in this session`,
+      };
+    }
+    const modulePosition = activeModuleIds.findIndex(
+      (moduleId) =>
+        moduleId === data.moduleId || moduleId === moduleEntity.name,
+    );
+    const moduleNumber = modulePosition >= 0 ? modulePosition + 1 : null;
+
+    const hintCount = moduleEntity.solutions?.length ?? 0;
+    if (hintCount === 0) {
+      return {
+        success: false,
+        message: 'No hint available for this module',
+      };
+    }
+
+    const requestedHintIndex = Math.max(1, data.hintIndex ?? 1);
+    if (requestedHintIndex > hintCount) {
+      return {
+        success: false,
+        message: `Hint index out of range (1-${hintCount})`,
+      };
+    }
+
+    const nextHintNumber = session.extraHintsUsed + 1;
+    const difficultyConfig = getDifficultyConfig(session.difficulty);
+    const maxHintsForDifficulty = difficultyConfig.extraHint.maxHints;
+    if (nextHintNumber > maxHintsForDifficulty) {
+      return {
+        success: false,
+        message: `Extra hint limit reached for ${session.difficulty} (${maxHintsForDifficulty} max)`,
+      };
+    }
+
+    const timeCostSeconds = getExtraHintCostForDifficulty(
+      session.difficulty,
+      nextHintNumber,
+    );
+    const remainingTime = Math.max(0, session.remainingTime - timeCostSeconds);
+
+    await this.sessionService.updateTimer(data.sessionCode, remainingTime);
+    const updatedSession = await this.sessionService.updateSession(
+      data.sessionCode,
+      { extraHintsUsed: nextHintNumber },
+    );
+    this.server
+      .to(data.sessionCode)
+      .emit('timerUpdate', { remaining: remainingTime });
+
+    const extraHintPayload = {
+      sessionCode: data.sessionCode,
+      moduleId: data.moduleId,
+      moduleNumber,
+      moduleName: moduleEntity.name,
+      message: `Indice supplémentaire débloqué pour ${moduleEntity.name}`,
+      hintIndex: requestedHintIndex,
+      hintText: moduleEntity.solutions[requestedHintIndex - 1],
+      hintNumber: nextHintNumber,
+      maxHintsForDifficulty,
+      timeCostSeconds,
+      remainingTime,
+      difficulty: session.difficulty,
+      extraHintsUsed: updatedSession?.extraHintsUsed ?? nextHintNumber,
+      requestedBy: client.id,
+      timestamp: new Date(),
+    };
+    this.server.to(data.sessionCode).emit('extraHintGranted', extraHintPayload);
+    // Alerte ciblée pour les analystes: un indice a été débloqué par l'agent.
+    const analysteIds = session.players
+      .filter((player) => player.role === PLAYER_ROLES.ANALYSTE)
+      .map((player) => player.id);
+    analysteIds.forEach((analysteId) => {
+      this.server.to(analysteId).emit('extraHintAlert', {
+        ...extraHintPayload,
+        message: `Indice supplémentaire débloqué pour ${moduleEntity.name}`,
+      });
+    });
+
+    if (remainingTime <= 0) {
+      await this.stopGameTimer(data.sessionCode);
+      const gameResult: GameResult = GAME_RESULTS.LOSE;
+      this.server.to(data.sessionCode).emit('gameOver', {
+        message: 'Le temps est écoulé !',
+        sessionCode: data.sessionCode,
+        difficulty: session.difficulty,
+        gameResult,
+      });
+      await this.sessionService.updateSession(data.sessionCode, { gameResult });
+    }
+
+    return { success: true, extraHint: extraHintPayload };
+  }
+
+  @SubscribeMessage('getExtraHintContext')
+  async handleGetExtraHintContext(
+    @MessageBody() data: { sessionCode: string },
+    @ConnectedSocket() client: Socket,
+  ) {
+    const session = await this.sessionService.getSession(data.sessionCode);
+    if (!session) {
+      return {
+        success: false,
+        message: `Session with code ${data.sessionCode} does not exist`,
+      };
+    }
+    if (session.agentId !== client.id) {
+      return {
+        success: false,
+        message: 'Only the agent can request extra hint context',
+      };
+    }
+
+    const difficultyConfig = getDifficultyConfig(session.difficulty);
+    const nextHintNumber = session.extraHintsUsed + 1;
+    const nextHintCostSeconds = getExtraHintCostForDifficulty(
+      session.difficulty,
+      nextHintNumber,
+    );
+    const rawActiveModuleIds: unknown = (
+      session as Session & { activeModuleIds?: unknown }
+    ).activeModuleIds;
+    const activeModuleIds = Array.isArray(rawActiveModuleIds)
+      ? rawActiveModuleIds.filter(
+          (moduleId): moduleId is string => typeof moduleId === 'string',
+        )
+      : [];
+    const availableModules: Array<{
+      moduleId: string;
+      moduleNumber: number;
+      moduleName: string;
+    }> = [];
+    for (const [index, moduleId] of activeModuleIds.entries()) {
+      const moduleEntity =
+        (await this.moduleService.findOne(moduleId)) ??
+        (await this.moduleService.findOneByName(moduleId));
+      availableModules.push({
+        moduleId,
+        moduleNumber: index + 1,
+        moduleName: moduleEntity?.name ?? moduleId,
+      });
+    }
+
+    client.emit('extraHintContext', {
+      sessionCode: data.sessionCode,
+      difficulty: session.difficulty,
+      extraHintsUsed: session.extraHintsUsed,
+      maxHintsForDifficulty: difficultyConfig.extraHint.maxHints,
+      nextHintNumber,
+      nextHintCostSeconds,
+      availableModules,
+    });
+
     return { success: true };
   }
 
@@ -797,7 +1023,7 @@ export class SessionsGateway implements OnGatewayDisconnect {
   }
 
   startGameTimer(sessionCode: string, session: Session) {
-    let remaining = session.maxTime;
+    let remaining = session.remainingTime;
 
     // Envoi immédiat pour synchroniser les clients qui viennent juste d'entrer.
     this.server.to(sessionCode).emit('timerUpdate', { remaining });
@@ -817,7 +1043,15 @@ export class SessionsGateway implements OnGatewayDisconnect {
         return;
       }
 
-      remaining -= 1;
+      // Synchroniser avec l'état persistant pour prendre en compte
+      // les ajustements externes (ex: indice supplémentaire).
+      const currentSession = await this.sessionService.getSession(sessionCode);
+      if (!currentSession) {
+        clearInterval(interval);
+        delete this.sessionTimers[sessionCode];
+        return;
+      }
+      remaining = currentSession.remainingTime - 1;
 
       // L'état Redis est mis à jour avant l'emit pour que les reconnexions
       // lisent la valeur la plus récente via getSession.

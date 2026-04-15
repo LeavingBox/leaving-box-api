@@ -53,6 +53,8 @@ export class SessionService {
       createdAt: new Date(),
       players: [agentPlayer],
       started: false,
+      extraHintsUsed: 0,
+      activeModuleIds: [],
       operatorActions: [],
       difficulty,
       gameMode,
@@ -77,6 +79,12 @@ export class SessionService {
     }
     if (!session.gameMode) {
       session.gameMode = DEFAULT_GAME_MODE;
+    }
+    if (typeof session.extraHintsUsed !== 'number') {
+      session.extraHintsUsed = 0;
+    }
+    if (!Array.isArray(session.activeModuleIds)) {
+      session.activeModuleIds = [];
     }
     return session;
   }
