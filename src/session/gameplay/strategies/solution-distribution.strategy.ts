@@ -27,22 +27,7 @@ const initResult = (recipientIds: string[]): DistributionResult => ({
   ) as SolutionsByAnalyste,
 });
 
-const assignModule = (
-  module: ModuleEntity,
-  analysteId: string,
-  result: DistributionResult,
-): void => {
-  const moduleId = getModuleId(module);
-  const solutions = toSolutionsWithIndex(module.solutions ?? []);
-
-  result.solutionsDistribution.push({
-    moduleId,
-    allocations: { [analysteId]: solutions },
-  });
-  result.solutionsByAnalyste[analysteId].push({ moduleId, solutions });
-};
-
-const distributeToAll = (
+const assignModuleToAll = (
   module: ModuleEntity,
   recipientIds: string[],
   result: DistributionResult,
@@ -55,13 +40,14 @@ const distributeToAll = (
 
   result.solutionsDistribution.push({ moduleId, allocations });
   recipientIds.forEach((id) => {
-    if (solutions.length > 0) {
-      result.solutionsByAnalyste[id].push({ moduleId, solutions });
-    }
+    result.solutionsByAnalyste[id].push({
+      moduleId,
+      solutions: [...solutions],
+    });
   });
 };
 
-/** 1 analyste = 1 module complet. Cas spécial : 3 analystes = 3 modules + 1 partagé */
+/** Mode standard: chaque analyste reçoit tous les modules avec toutes les solutions. */
 export class OneOperatorOneModuleDistributionStrategy
   implements SolutionDistributionStrategy
 {
@@ -72,20 +58,8 @@ export class OneOperatorOneModuleDistributionStrategy
     const result = initResult(recipientIds);
     if (modules.length === 0) return result;
 
-    const count = recipientIds.length;
-
-    if (count === 3 && modules.length >= 3) {
-      [0, 1, 2].forEach((i) =>
-        assignModule(modules[i], recipientIds[i], result),
-      );
-      if (modules.length >= 4) {
-        distributeToAll(modules[3], recipientIds, result);
-      }
-      return result;
-    }
-
-    modules.forEach((module, i) =>
-      assignModule(module, recipientIds[i % count], result),
+    modules.forEach((module) =>
+      assignModuleToAll(module, recipientIds, result),
     );
     return result;
   }
