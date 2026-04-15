@@ -1,29 +1,47 @@
 import {
   ConnectedSocket,
   MessageBody,
+  OnGatewayDisconnect,
   SubscribeMessage,
   WebSocketGateway,
   WebSocketServer,
 } from '@nestjs/websockets';
+import { Logger } from '@nestjs/common';
 import { Server, Socket } from 'socket.io';
 import { SessionService } from './session.service';
 import { ModuleService } from 'src/game/modules/module.service';
-import { Session } from './interface/session.interface';
+import { GameResult, Session } from './interface/session.interface';
+import { GameplayService } from './gameplay/gameplay.service';
+import {
+  DEFAULT_GAME_DIFFICULTY,
+  DEFAULT_GAME_MODE,
+  GAME_RESULTS,
+  MAX_ANALYSTES_PER_SESSION,
+  PLAYER_ROLES,
+  TIMER_TICK_INTERVAL_MS,
+} from './config/session.config';
 
 @WebSocketGateway({
   cors: {
     origin: '*',
     methods: ['GET', 'POST'],
     allowedHeaders: ['*'],
+    credentials: true,
   },
+  transports: ['websocket', 'polling'],
+  allowEIO3: true,
 })
-export class SessionsGateway {
+export class SessionsGateway implements OnGatewayDisconnect {
   @WebSocketServer()
   server: Server;
+
+  private readonly logger = new Logger(SessionsGateway.name);
+  private readonly maxAnalystesPerSession = MAX_ANALYSTES_PER_SESSION;
 
   constructor(
     private readonly sessionService: SessionService,
     private readonly moduleService: ModuleService,
+    private readonly gameplayService: GameplayService,
   ) {}
 
   // Objet pour stocker les intervalles de timer par session
@@ -33,25 +51,61 @@ export class SessionsGateway {
   @SubscribeMessage('createSession')
   async handleCreateSession(
     @MessageBody()
-    data: { difficulty: 'Easy' | 'Medium' | 'Hard' },
+    data: {
+      difficulty: 'Easy' | 'Medium' | 'Hard';
+      gameMode?: 'ONE_OPERATOR_ONE_MODULE' | 'RANDOM_ONE_MODULE_SPLIT';
+      role: 'agent' | 'analyste';
+    },
     @ConnectedSocket() client: Socket,
   ) {
     try {
+      // Vérifier que le role est fourni
+      if (!data.role) {
+        return {
+          success: false,
+          message: 'Role is required',
+        };
+      }
+
+      // La difficulté doit être choisie par le joueur
+      if (!data.difficulty) {
+        return {
+          success: false,
+          message:
+            'Difficulty is required. Please choose Easy, Medium or Hard.',
+        };
+      }
+
+      const difficulty = data.difficulty;
+
+      // Vérifier que seul un agent peut créer une session
+      if (data.role !== PLAYER_ROLES.AGENT) {
+        return {
+          success: false,
+          message: 'Only an agent can create a session',
+        };
+      }
+
+      // Mode de jeu par défaut si non fourni
+      const gameMode = data.gameMode || DEFAULT_GAME_MODE;
+
       const session = await this.sessionService.createSession({
-        difficulty: data.difficulty,
+        difficulty,
+        gameMode,
         agentId: client.id,
       });
-      // Remove other rooms except the socket's own id.
+      // Ce socket ne doit appartenir qu'à une seule session active:
+      // on purge d'abord ses anciennes rooms pour éviter les émissions croisées.
       for (const room of client.rooms) {
         if (room !== client.id) {
           await this.sessionService.deleteSession(room);
-          client.leave(room);
+          await client.leave(room);
         }
       }
-      client.join(session.code);
+      await client.join(session.code);
       client.emit('sessionCreated', session);
     } catch (error) {
-      console.error(error);
+      this.logger.error('Erreur lors de la création de session:', error);
       client.emit('error', { message: 'Failed to create session' });
     }
   }
@@ -59,7 +113,7 @@ export class SessionsGateway {
   @SubscribeMessage('getSession')
   async handleGetSessions(
     @ConnectedSocket() client: Socket,
-    @MessageBody() data: { sessionCode: string },
+    @MessageBody() data: { sessionCode: string; currentPath?: string },
   ) {
     const sessionData = await this.sessionService.getSession(data.sessionCode);
 
@@ -68,6 +122,44 @@ export class SessionsGateway {
         success: false,
         message: `Session with code ${data.sessionCode} does not exist`,
       };
+    }
+
+    // Si un opérateur envoie son chemin actuel, on peut détecter un retour en arrière
+    if (data.currentPath) {
+      const player = sessionData.players.find((p) => p.id === client.id);
+      if (player && player.role === PLAYER_ROLES.ANALYSTE) {
+        // Enregistrer cette requête comme une action de navigation
+        await this.sessionService.addOperatorAction(
+          data.sessionCode,
+          client.id,
+          'getSession',
+          { path: data.currentPath, timestamp: new Date() },
+        );
+
+        // Détecter un retour en arrière
+        const isBackNavigation = await this.sessionService.detectBackNavigation(
+          data.sessionCode,
+          client.id,
+        );
+
+        if (isBackNavigation) {
+          const backNavData = {
+            sessionCode: data.sessionCode,
+            operatorId: client.id,
+            operatorLabel: player.label,
+            timestamp: new Date(),
+            path: data.currentPath,
+            autoDetected: true,
+          };
+
+          const agentSocket = this.server.sockets.sockets.get(
+            sessionData.agentId,
+          );
+          if (agentSocket) {
+            agentSocket.emit('operatorBackNavigation', backNavData);
+          }
+        }
+      }
     }
 
     const clients = await this.server.in(data.sessionCode).fetchSockets();
@@ -92,18 +184,61 @@ export class SessionsGateway {
     @MessageBody() data: { sessionCode: string; player: string },
     @ConnectedSocket() client: Socket,
   ) {
-    const rooms = client.rooms;
-    for (const room of rooms) {
-      if (room !== client.id) {
-        client.leave(room);
-      }
-    }
-    client.join(data.sessionCode);
+    let session: Session | null = null;
+    try {
+      session = await this.sessionService.addPlayerToSession(
+        data.sessionCode,
+        client.id,
+        PLAYER_ROLES.ANALYSTE,
+      );
+    } catch (error) {
+      if (error instanceof Error && error.message === 'MAX_ANALYSTES_REACHED') {
+        const currentSession = await this.sessionService.getSession(
+          data.sessionCode,
+        );
+        const analysteCount =
+          currentSession?.players.filter(
+            (player) => player.role === PLAYER_ROLES.ANALYSTE,
+          ).length ?? this.maxAnalystesPerSession;
+        const sessionFullAlert = {
+          message: `Limite atteinte: maximum ${this.maxAnalystesPerSession} analystes autorisés dans cette session.`,
+          sessionCode: data.sessionCode,
+          analysteCount,
+          maxAnalystes: this.maxAnalystesPerSession,
+          rejectedPlayerId: client.id,
+          reason: 'MAX_ANALYSTES_REACHED',
+        };
 
-    const session = await this.sessionService.addPlayerToSession(
-      data.sessionCode,
-      `${client.id}-${data.player}`,
-    );
+        // Alerte ciblée pour le joueur refusé (events métier explicites).
+        client.emit('joinSessionRejected', sessionFullAlert);
+        client.emit('sessionFull', sessionFullAlert);
+        // Ciblage explicite par id de socket pour éviter toute ambiguïté de transport.
+        this.server.to(client.id).emit('joinSessionRejected', sessionFullAlert);
+        this.server.to(client.id).emit('sessionFull', sessionFullAlert);
+        this.logger.warn('Connexion refusée: limite analystes atteinte', {
+          sessionCode: data.sessionCode,
+          rejectedPlayerId: client.id,
+          analysteCount,
+          maxAnalystes: this.maxAnalystesPerSession,
+        });
+
+        return {
+          success: false,
+          message: `Session full: maximum ${this.maxAnalystesPerSession} analystes allowed (sessionFull emitted)`,
+          reason: sessionFullAlert.reason,
+          alert: sessionFullAlert,
+        };
+      }
+      this.logger.error(
+        "Erreur lors de l'ajout du joueur à la session:",
+        error,
+      );
+      return {
+        success: false,
+        message: 'Failed to join session',
+      };
+    }
+
     if (!session) {
       return {
         success: false,
@@ -111,8 +246,27 @@ export class SessionsGateway {
       };
     }
 
+    // Le socket rejoint la room uniquement après validation métier côté backend.
+    const rooms = client.rooms;
+    for (const room of rooms) {
+      if (room !== client.id) {
+        await client.leave(room);
+      }
+    }
+    await client.join(data.sessionCode);
+
+    const player = session.players.find((p) => p.id === client.id);
+    if (!player) {
+      return {
+        success: false,
+        message: 'Failed to add player to session',
+      };
+    }
+
     this.server.to(data.sessionCode).emit('playerJoined', {
-      player: data.player,
+      playerId: client.id,
+      playerLabel: player.label,
+      playerRole: player.role, // OBLIGATOIRE
       session,
     });
 
@@ -124,13 +278,13 @@ export class SessionsGateway {
     @MessageBody() data: { sessionCode: string; player: string },
     @ConnectedSocket() client: Socket,
   ) {
-    //TODO - HANDLE WITH CLIENT (REMOVE OPERATOR ON SESSION LEAVE)
-    // Supprime le joueur de la session dans Redis
-    const session = await this.sessionService.removePlayerFromSession(
+    // Gérer le retrait du joueur
+    const removalResult = await this.handlePlayerRemoval(
       data.sessionCode,
-      `${client.id}-${data.player}`,
+      client.id,
     );
-    if (!session) {
+
+    if (!removalResult.session) {
       return {
         success: false,
         message: `Session with code ${data.sessionCode} does not exist`,
@@ -138,12 +292,18 @@ export class SessionsGateway {
     }
 
     // Le client quitte la salle correspondant à la session
-    client.leave(data.sessionCode);
+    await client.leave(data.sessionCode);
+
+    // Si la session doit être fermée
+    if (removalResult.shouldClose && removalResult.reason) {
+      await this.closeSession(removalResult.session, removalResult.reason);
+      return { success: true, sessionClosed: true };
+    }
 
     // Informe tous les clients de la salle que le joueur a quitté
     this.server.to(data.sessionCode).emit('playerLeft', {
-      player: `${client.id}-${data.player}`,
-      session,
+      playerId: client.id,
+      session: removalResult.session,
     });
 
     return { success: true };
@@ -154,7 +314,6 @@ export class SessionsGateway {
     @MessageBody() data: { sessionCode: string },
     @ConnectedSocket() client: Socket,
   ) {
-    //TODO - HANDLE WITH CLIENT (ONLY AGENT CAN START GAME)
     const session = await this.sessionService.getSession(data.sessionCode);
     if (!session) {
       return {
@@ -162,17 +321,86 @@ export class SessionsGateway {
         message: `Session with code ${data.sessionCode} does not exist`,
       };
     }
+    if (session.agentId !== client.id) {
+      return {
+        success: false,
+        message: 'Only the agent can start the game',
+      };
+    }
 
-    this.sessionService.updateSession(data.sessionCode, {
-      started: true,
+    const updatedSession =
+      (await this.sessionService.updateSession(data.sessionCode, {
+        started: true,
+      })) ?? session;
+    const analystes = updatedSession.players.filter(
+      (p) => p.role === PLAYER_ROLES.ANALYSTE,
+    );
+    this.logger.log("État file d'attente avant lancement", {
+      sessionCode: data.sessionCode,
+      analysteCount: analystes.length,
+      maxAnalystes: this.maxAnalystesPerSession,
+      analystes: analystes.map((player) => ({
+        id: player.id,
+        label: player.label,
+      })),
     });
-    const moduleManuals = await this.moduleService.findSome(5);
 
-    this.server
-      .to(data.sessionCode)
-      .emit('gameStarted', { session, moduleManuals });
+    if (analystes.length === 0) {
+      return {
+        success: false,
+        message: 'At least one analyste is required to start the game',
+      };
+    }
+    if (analystes.length > this.maxAnalystesPerSession) {
+      this.logger.error('Lancement refusé: trop analystes dans la session', {
+        sessionCode: data.sessionCode,
+        analysteCount: analystes.length,
+        maxAnalystes: this.maxAnalystesPerSession,
+      });
+      return {
+        success: false,
+        message: `Cannot start game: maximum ${this.maxAnalystesPerSession} analystes allowed`,
+      };
+    }
 
-    return { success: true };
+    try {
+      // Utiliser le service de gameplay pour démarrer la partie
+      const analysteIds = analystes.map((a) => a.id);
+      // Valeurs par défaut pour compatibilité avec les anciennes sessions
+      const difficulty = session.difficulty || DEFAULT_GAME_DIFFICULTY;
+      const gameMode = session.gameMode || DEFAULT_GAME_MODE;
+
+      const gameplayResult = await this.gameplayService.startGameWithOperators(
+        {
+          difficulty,
+          gameMode,
+        },
+        analysteIds,
+      );
+
+      this.server.to(data.sessionCode).emit('gameStarted', {
+        session: updatedSession,
+        moduleManuals: gameplayResult.moduleManuals,
+        solutionsDistribution: gameplayResult.solutionsDistribution,
+        solutionsByAnalyste: gameplayResult.solutionsByAnalyste,
+      });
+      this.logger.log('Partie lancée', {
+        sessionCode: data.sessionCode,
+        difficulty,
+        gameMode,
+        analysteCount: analystes.length,
+        analysteIds,
+      });
+
+      return { success: true };
+    } catch (error) {
+      this.logger.error('Erreur lors du démarrage du jeu:', error);
+      return {
+        success: false,
+        message:
+          error instanceof Error ? error.message : 'Failed to start the game',
+      };
+    }
   }
 
   @SubscribeMessage('clearSession')
@@ -181,62 +409,445 @@ export class SessionsGateway {
     @ConnectedSocket() client: Socket,
   ) {
     try {
-      console.log('sessionCleared', data);
-      await this.sessionService.deleteSession(data.sessionCode);
+      const session = await this.sessionService.getSession(data.sessionCode);
+      if (!session) {
+        return {
+          success: false,
+          message: `Session with code ${data.sessionCode} does not exist`,
+        };
+      }
+      if (session.agentId !== client.id) {
+        return {
+          success: false,
+          message: 'Only the agent can clear the session',
+        };
+      }
+
+      await this.sessionService.deleteSession(
+        data.sessionCode,
+        session.difficulty,
+      );
       this.server
         .to(data.sessionCode)
         .emit('sessionCleared', { sessionCode: data.sessionCode });
-      this.stopGameTimer(data.sessionCode);
+      await this.stopGameTimer(data.sessionCode);
       this.server.to(data.sessionCode).socketsLeave(data.sessionCode);
 
       return { success: true };
     } catch (error) {
-      console.log('error', error);
+      this.logger.error('Erreur lors de la suppression de session:', error);
       return { success: false, message: 'Failed to clear session' };
     }
   }
 
   @SubscribeMessage('startTimer')
-  async handleStartTimer(@MessageBody() data: { sessionCode: string }) {
-    // Démarre le timer pour la session avec la durée spécifiée (en secondes)
-    const session = await this.sessionService.startTimer(data.sessionCode);
+  async handleStartTimer(
+    @MessageBody() data: { sessionCode: string },
+    @ConnectedSocket() client: Socket,
+  ) {
+    const session = await this.sessionService.getSession(data.sessionCode);
     if (!session) {
       return {
         success: false,
-        message: `Session with code ${data.sessionCode} does not exist or has allready started`,
+        message: `Session with code ${data.sessionCode} does not exist`,
       };
     }
-    this.startGameTimer(data.sessionCode, session);
+    const analystes = session.players.filter(
+      (p) => p.role === PLAYER_ROLES.ANALYSTE,
+    );
+    if (analystes.length === 0) {
+      return {
+        success: false,
+        message: 'At least one analyste is required to start the timer',
+      };
+    }
+    if (session.agentId !== client.id) {
+      return {
+        success: false,
+        message: 'Only the agent can start the timer',
+      };
+    }
+    if (session.timerStarted) {
+      return {
+        success: false,
+        message: 'Timer already started',
+      };
+    }
+
+    const updatedSession = await this.sessionService.startTimer(
+      data.sessionCode,
+    );
+    if (!updatedSession) {
+      return { success: false, message: 'Failed to start timer' };
+    }
+    this.startGameTimer(data.sessionCode, updatedSession);
+    return { success: true };
   }
 
   @SubscribeMessage('stopTimer')
-  handleStopTimer(@MessageBody() data: { sessionCode: string }) {
-    this.stopGameTimer(data.sessionCode);
+  async handleStopTimer(
+    @MessageBody() data: { sessionCode: string },
+    @ConnectedSocket() client: Socket,
+  ) {
+    const session = await this.sessionService.getSession(data.sessionCode);
+    if (!session) {
+      return {
+        success: false,
+        message: `Session with code ${data.sessionCode} does not exist`,
+      };
+    }
+    if (session.agentId !== client.id) {
+      return {
+        success: false,
+        message: 'Only the agent can stop the timer',
+      };
+    }
+
+    await this.stopGameTimer(data.sessionCode);
+    return { success: true };
   }
 
-  async startGameTimer(sessionCode: string, session: Session) {
+  /**
+   * Enregistre une action d'un opérateur (navigation, interaction, etc.)
+   * Permet de suivre l'historique des actions pour détecter les retours en arrière
+   */
+  @SubscribeMessage('operatorAction')
+  async handleOperatorAction(
+    @MessageBody()
+    data: {
+      sessionCode: string;
+      action: string;
+      data?: Record<string, unknown>;
+    },
+    @ConnectedSocket() client: Socket,
+  ) {
+    try {
+      const session = await this.sessionService.getSession(data.sessionCode);
+      if (!session) {
+        return {
+          success: false,
+          message: `Session with code ${data.sessionCode} does not exist`,
+        };
+      }
+
+      // Vérifier que le client est un opérateur dans cette session
+      const player = session.players.find((p) => p.id === client.id);
+      if (!player || player.role !== PLAYER_ROLES.ANALYSTE) {
+        return {
+          success: false,
+          message: 'Only analystes can send actions',
+        };
+      }
+
+      // Enregistrer l'action
+      const updatedSession = await this.sessionService.addOperatorAction(
+        data.sessionCode,
+        client.id,
+        data.action,
+        data.data,
+      );
+
+      if (!updatedSession) {
+        return {
+          success: false,
+          message: 'Failed to record action',
+        };
+      }
+
+      // Détecter automatiquement un retour en arrière
+      const isBackNavigation = await this.sessionService.detectBackNavigation(
+        data.sessionCode,
+        client.id,
+      );
+
+      if (isBackNavigation) {
+        // Notifier l'agent qu'un opérateur a fait un retour en arrière
+        const operatorLabel = player.label;
+        const backNavData = {
+          sessionCode: data.sessionCode,
+          operatorId: client.id,
+          operatorLabel,
+          timestamp: new Date(),
+          autoDetected: true,
+          action: data.action,
+          data: data.data,
+        };
+
+        // Vérifier que l'agent est toujours connecté
+        const agentSocket = this.server.sockets.sockets.get(session.agentId);
+        if (agentSocket) {
+          agentSocket.emit('operatorBackNavigation', backNavData);
+        } else {
+          this.logger.warn(
+            'Agent non connecté pour la détection automatique du retour en arrière',
+            {
+              sessionCode: data.sessionCode,
+              agentId: session.agentId,
+            },
+          );
+        }
+      }
+
+      return { success: true };
+    } catch (error) {
+      this.logger.error(
+        "Erreur lors du traitement de l'action opérateur:",
+        error,
+      );
+      return {
+        success: false,
+        message: 'Failed to process action',
+      };
+    }
+  }
+
+  /**
+   * Événement simple pour signaler un retour en arrière
+   * Le client peut appeler cet événement directement quand il détecte un retour en arrière
+   * Format minimal : { sessionCode: string }
+   */
+  @SubscribeMessage('back')
+  async handleBack(
+    @MessageBody() data: { sessionCode: string },
+    @ConnectedSocket() client: Socket,
+  ) {
+    // Rediriger vers handleOperatorBackNavigation
+    return this.handleOperatorBackNavigation(
+      { sessionCode: data.sessionCode },
+      client,
+    );
+  }
+
+  /**
+   * Événement explicite pour signaler un retour en arrière
+   * Le client peut appeler cet événement directement quand il détecte un retour en arrière
+   */
+  @SubscribeMessage('operatorBackNavigation')
+  async handleOperatorBackNavigation(
+    @MessageBody() data: { sessionCode: string; path?: string; state?: string },
+    @ConnectedSocket() client: Socket,
+  ) {
+    try {
+      const session = await this.sessionService.getSession(data.sessionCode);
+      if (!session) {
+        this.logger.error('Session non trouvée', {
+          sessionCode: data.sessionCode,
+        });
+        return {
+          success: false,
+          message: `Session with code ${data.sessionCode} does not exist`,
+        };
+      }
+
+      // Vérifier que le client est dans la session
+      const player = session.players.find((p) => p.id === client.id);
+      if (!player) {
+        this.logger.error('Joueur non trouvé dans la session', {
+          clientId: client.id,
+          sessionCode: data.sessionCode,
+        });
+        return {
+          success: false,
+          message: 'Player not found in session',
+        };
+      }
+
+      // Si c'est l'agent qui fait un retour en arrière, on log mais on ne notifie pas
+      if (player.role === PLAYER_ROLES.AGENT) {
+        // Enregistrer l'action pour l'historique
+        await this.sessionService.addOperatorAction(
+          data.sessionCode,
+          client.id,
+          'back',
+          {
+            reported: true,
+            timestamp: new Date(),
+            path: data.path,
+            state: data.state,
+            role: PLAYER_ROLES.AGENT,
+          },
+        );
+        return { success: true, message: 'Agent back navigation recorded' };
+      }
+
+      // Si c'est un opérateur, on enregistre et on notifie l'agent
+      if (player.role !== PLAYER_ROLES.ANALYSTE) {
+        this.logger.error('Rôle invalide pour le retour en arrière', {
+          clientId: client.id,
+          role: player.role,
+        });
+        return {
+          success: false,
+          message: 'Only analystes and agents can report back navigation',
+        };
+      }
+
+      // Enregistrer l'action de retour en arrière
+      const updatedSession = await this.sessionService.addOperatorAction(
+        data.sessionCode,
+        client.id,
+        'back',
+        {
+          reported: true,
+          timestamp: new Date(),
+          path: data.path,
+          state: data.state,
+        },
+      );
+
+      if (!updatedSession) {
+        this.logger.error("Échec de l'ajout de l'action opérateur");
+        return {
+          success: false,
+          message: 'Failed to record back navigation',
+        };
+      }
+
+      // Notifier l'agent
+      const backNavData = {
+        sessionCode: data.sessionCode,
+        operatorId: client.id,
+        operatorLabel: player.label,
+        timestamp: new Date(),
+        path: data.path,
+        state: data.state,
+      };
+
+      // Vérifier que l'agent est toujours connecté
+      const agentSocket = this.server.sockets.sockets.get(session.agentId);
+      if (agentSocket) {
+        agentSocket.emit('operatorBackNavigation', backNavData);
+      } else {
+        this.logger.warn('Agent non connecté pour le retour en arrière', {
+          sessionCode: data.sessionCode,
+          agentId: session.agentId,
+        });
+      }
+
+      // Aussi diffuser à toute la session pour le debug (optionnel)
+      this.server.to(data.sessionCode).emit('operatorBackNavigationDetected', {
+        sessionCode: data.sessionCode,
+        operatorId: client.id,
+        operatorLabel: player.label,
+        timestamp: new Date(),
+      });
+
+      return { success: true, data: backNavData };
+    } catch (error) {
+      this.logger.error(
+        'Erreur lors du traitement du retour en arrière:',
+        error,
+      );
+      return {
+        success: false,
+        message: 'Failed to report back navigation',
+        error: error instanceof Error ? error.message : 'Unknown error',
+      };
+    }
+  }
+
+  /**
+   * Permet à l'agent de récupérer l'historique des actions d'un opérateur
+   */
+  @SubscribeMessage('getOperatorActions')
+  async handleGetOperatorActions(
+    @MessageBody()
+    data: { sessionCode: string; operatorId?: string },
+    @ConnectedSocket() client: Socket,
+  ) {
+    try {
+      const session = await this.sessionService.getSession(data.sessionCode);
+      if (!session) {
+        return {
+          success: false,
+          message: `Session with code ${data.sessionCode} does not exist`,
+        };
+      }
+
+      // Seul l'agent peut consulter les actions
+      if (session.agentId !== client.id) {
+        return {
+          success: false,
+          message: 'Only the agent can view operator actions',
+        };
+      }
+
+      const actions = await this.sessionService.getOperatorActions(
+        data.sessionCode,
+        data.operatorId,
+      );
+
+      client.emit('operatorActionsHistory', {
+        sessionCode: data.sessionCode,
+        operatorId: data.operatorId,
+        actions,
+      });
+
+      return { success: true };
+    } catch (error) {
+      this.logger.error(
+        'Erreur lors de la récupération des actions opérateur:',
+        error,
+      );
+      return {
+        success: false,
+        message: 'Failed to get operator actions',
+      };
+    }
+  }
+
+  startGameTimer(sessionCode: string, session: Session) {
     let remaining = session.maxTime;
 
+    // Envoi immédiat pour synchroniser les clients qui viennent juste d'entrer.
     this.server.to(sessionCode).emit('timerUpdate', { remaining });
 
-    const interval = setInterval(async () => {
-      remaining--;
-      console.log('Remaining time:', remaining, ' for session : ', sessionCode);
+    const tick = async () => {
+      // Vérifier si le timer doit continuer
+      const timerCheck = await this.shouldTimerContinue(sessionCode);
 
-      // Met à jour Redis avec le temps restant
+      if (!timerCheck.shouldContinue) {
+        // Arrêter le timer
+        clearInterval(interval);
+        delete this.sessionTimers[sessionCode];
+        this.logger.log('Timer arrêté', {
+          sessionCode,
+          reason: timerCheck.reason,
+        });
+        return;
+      }
+
+      remaining -= 1;
+
+      // L'état Redis est mis à jour avant l'emit pour que les reconnexions
+      // lisent la valeur la plus récente via getSession.
       await this.sessionService.updateTimer(sessionCode, remaining);
-
       this.server.to(sessionCode).emit('timerUpdate', { remaining });
 
       if (remaining <= 0) {
         clearInterval(interval);
         delete this.sessionTimers[sessionCode];
-        this.server
-          .to(sessionCode)
-          .emit('gameOver', { message: 'Le temps est écoulé !' });
+        const gameResult: GameResult = GAME_RESULTS.LOSE;
+        // On publie un payload complet afin que le front puisse décider
+        // du rendu (message, score final, analytics) sans second appel.
+        this.server.to(sessionCode).emit('gameOver', {
+          message: 'Le temps est écoulé !',
+          sessionCode,
+          difficulty: session.difficulty,
+          gameResult,
+        });
+        await this.sessionService.updateSession(sessionCode, {
+          gameResult,
+        });
         await this.sessionService.updateTimer(sessionCode, 0);
       }
-    }, 1000);
+    };
+
+    const interval = setInterval(() => {
+      // On évite de bloquer la boucle d'event-loop:
+      // les erreurs éventuelles sont gérées dans tick et loguées.
+      void tick();
+    }, TIMER_TICK_INTERVAL_MS);
 
     this.sessionTimers[sessionCode] = interval;
   }
@@ -248,5 +859,220 @@ export class SessionsGateway {
       await this.sessionService.updateTimer(sessionCode, 0);
       this.server.to(sessionCode).emit('timerStopped', { sessionCode });
     }
+  }
+
+  /**
+   * Gère la déconnexion d'un client
+   * Si l'agent se déconnecte, la partie est fermée
+   * Si un opérateur se déconnecte et qu'il ne reste plus d'opérateurs, la partie est fermée
+   */
+  async handleDisconnect(client: Socket) {
+    try {
+      // Récupérer toutes les sessions pour trouver celles où le client est présent
+      const sessionKeys = await this.sessionService.getAllSessions();
+
+      for (const sessionKey of sessionKeys) {
+        const sessionCode = sessionKey.replace('session:', '');
+        const session = await this.sessionService.getSession(sessionCode);
+
+        if (!session) {
+          continue;
+        }
+
+        // Vérifier si le client déconnecté est dans cette session
+        const player = session.players.find((p) => p.id === client.id);
+
+        if (!player) {
+          continue;
+        }
+
+        // Gérer le retrait du joueur
+        const removalResult = await this.handlePlayerRemoval(
+          sessionCode,
+          client.id,
+        );
+
+        if (!removalResult.session) {
+          continue;
+        }
+
+        // Si la session doit être fermée
+        if (removalResult.shouldClose && removalResult.reason) {
+          this.logger.warn('Fermeture de session due à la déconnexion', {
+            sessionCode,
+            disconnectedPlayerId: client.id,
+            disconnectedPlayerRole: player.role,
+            reason: removalResult.reason,
+            difficulty: removalResult.session.difficulty,
+          });
+          await this.closeSession(removalResult.session, removalResult.reason);
+          continue;
+        }
+
+        // Si la session reste active, informer les autres clients que le joueur a quitté
+        this.server.to(sessionCode).emit('playerLeft', {
+          playerId: client.id,
+          session: removalResult.session,
+        });
+      }
+    } catch (error) {
+      this.logger.error('Erreur lors de la gestion de la déconnexion:', error);
+    }
+  }
+
+  /**
+   * Ferme une session (méthode privée réutilisable)
+   */
+  private async closeSession(session: Session, reason: string) {
+    try {
+      const sessionCode = session.code;
+      const gameResult: GameResult = GAME_RESULTS.LOSE;
+      // 1) Arrêter le timer en premier pour éviter tout nouvel emit timerUpdate.
+      await this.stopGameTimer(sessionCode);
+
+      // 2) Supprimer la session de Redis avant d'expulser les sockets:
+      // ainsi une reconnexion rapide ne peut pas ressusciter un état obsolète.
+      await this.sessionService.deleteSession(sessionCode, session.difficulty);
+
+      // 3) Notifier explicitement la cause et le contexte de fin de partie.
+      this.server.to(sessionCode).emit('gameOver', {
+        message: reason,
+        sessionCode,
+        difficulty: session.difficulty,
+        gameResult,
+      });
+
+      // 4) Nettoyage réseau final: aucun client ne reste abonné à la room.
+      this.server.to(sessionCode).socketsLeave(sessionCode);
+
+      this.logger.log('Session fermée', {
+        sessionCode,
+        reason,
+        difficulty: session.difficulty,
+      });
+    } catch (error) {
+      this.logger.error('Erreur lors de la fermeture de session:', error);
+    }
+  }
+
+  // ==================== MÉTHODES DE VALIDATION ====================
+
+  /**
+   * Vérifie si une session respecte les exigences minimales (1 agent + 1 opérateur)
+   */
+  private validateSessionRequirements(session: Session): {
+    isValid: boolean;
+    hasAgent: boolean;
+    hasOperator: boolean;
+    reason?: string;
+  } {
+    const hasAgent = session.players.some((p) => p.role === PLAYER_ROLES.AGENT);
+    const hasAnalyste = session.players.some(
+      (p) => p.role === PLAYER_ROLES.ANALYSTE,
+    );
+    const isValid = hasAgent && hasAnalyste;
+
+    let reason: string | undefined;
+    if (!isValid) {
+      reason = !hasAgent
+        ? "L'agent a quitté la session"
+        : 'Tous les analystes ont quitté la session';
+    }
+
+    return { isValid, hasAgent, hasOperator: hasAnalyste, reason };
+  }
+
+  /**
+   * Détermine si une session doit être fermée après le retrait d'un joueur
+   */
+  private shouldCloseSession(session: Session | null): {
+    shouldClose: boolean;
+    reason?: string;
+  } {
+    if (!session) {
+      return { shouldClose: true, reason: 'Session introuvable' };
+    }
+
+    const validation = this.validateSessionRequirements(session);
+    return {
+      shouldClose: !validation.isValid,
+      reason: validation.reason,
+    };
+  }
+
+  // ==================== MÉTHODES DE GESTION DES JOUEURS ====================
+
+  /**
+   * Récupère les informations sur les joueurs d'une session
+   */
+  private getSessionPlayersInfo(session: Session): {
+    agents: Session['players'];
+    operators: Session['players'];
+    agentCount: number;
+    operatorCount: number;
+  } {
+    const agents = session.players.filter((p) => p.role === PLAYER_ROLES.AGENT);
+    const analystes = session.players.filter(
+      (p) => p.role === PLAYER_ROLES.ANALYSTE,
+    );
+
+    return {
+      agents,
+      operators: analystes,
+      agentCount: agents.length,
+      operatorCount: analystes.length,
+    };
+  }
+
+  /**
+   * Gère le retrait d'un joueur et vérifie si la session doit être fermée
+   */
+  private async handlePlayerRemoval(
+    sessionCode: string,
+    playerId: string,
+  ): Promise<{
+    session: Session | null;
+    shouldClose: boolean;
+    reason?: string;
+  }> {
+    // Retirer le joueur de la session
+    const session = await this.sessionService.removePlayerFromSession(
+      sessionCode,
+      playerId,
+    );
+
+    // Vérifier si la session doit être fermée
+    const closeCheck = this.shouldCloseSession(session);
+
+    return {
+      session,
+      shouldClose: closeCheck.shouldClose,
+      reason: closeCheck.reason,
+    };
+  }
+
+  // ==================== MÉTHODES DE GESTION DU TIMER ====================
+
+  /**
+   * Vérifie si le timer doit continuer à tourner
+   */
+  private async shouldTimerContinue(sessionCode: string): Promise<{
+    shouldContinue: boolean;
+    reason?: string;
+  }> {
+    const session = await this.sessionService.getSession(sessionCode);
+
+    if (!session) {
+      return {
+        shouldContinue: false,
+        reason: "Session n'existe plus",
+      };
+    }
+
+    const validation = this.validateSessionRequirements(session);
+    return {
+      shouldContinue: validation.isValid,
+      reason: validation.reason,
+    };
   }
 }
