@@ -7,29 +7,11 @@ export interface ModuleSelectionStrategy {
 
 /**
  * Stratégie : 1 opérateur = 1 module complet
- * Si 4 modules ou moins disponibles : affiche tous les modules
- * Si plus de 4 modules : sélectionne 4 modules aléatoirement
- * Distribution spéciale selon le nombre d'opérateurs :
- * - 2 opérateurs : 2 modules chacun (2x2)
- * - 3 opérateurs : 2 modules individuels + 1 module partagé
- * - 4+ opérateurs : round-robin sur les modules
+ * Tous les modules sont fournis (aucune sélection aléatoire).
  */
 export class OneOperatorOneModuleStrategy implements ModuleSelectionStrategy {
   selectModules(availableModules: ModuleEntity[]): ModuleEntity[] {
-    // Si 4 modules ou moins, retourner tous les modules
-    if (availableModules.length <= 4) {
-      return [...availableModules];
-    }
-
-    // Si plus de 4 modules, sélectionner 4 modules aléatoirement
-    const selectedModules: ModuleEntity[] = [];
-    const shuffled = [...availableModules].sort(() => Math.random() - 0.5);
-
-    for (let i = 0; i < 4; i++) {
-      selectedModules.push(shuffled[i]);
-    }
-
-    return selectedModules;
+    return [...availableModules];
   }
 }
 

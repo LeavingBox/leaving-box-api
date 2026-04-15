@@ -18,31 +18,19 @@ La configuration est centralisée dans `src/session/gameplay/config/difficulty.c
 
 ### 1. ONE_OPERATOR_ONE_MODULE (Par défaut)
 
-**Description** : Affiche tous les modules disponibles (si 4 ou moins) ou sélectionne 4 modules aléatoirement, puis les répartit selon le nombre d'opérateurs.
+**Description** : Affiche tous les modules disponibles et envoie chaque module à tous les opérateurs avec toutes les solutions.
 
 **Comportement** :
-- **Si 4 modules ou moins disponibles** : Affiche tous les modules (pas de sélection aléatoire)
-- **Si plus de 4 modules** : Sélectionne 4 modules aléatoirement
-- **2 opérateurs** : 2 modules chacun (2x2)
-- **3 opérateurs** : 2 modules individuels + 1 module partagé (solutions réparties pareillement entre les 3 opérateurs)
-- **4+ opérateurs** : Round-robin sur les modules disponibles
+- **Quel que soit le nombre d'opérateurs (2, 3, 4+)** : Tous les modules sont sélectionnés
+- **Quel que soit le nombre d'opérateurs (2, 3, 4+)** : Chaque opérateur reçoit toutes les solutions de chaque module
 
 **Exemples** :
 
-**2 opérateurs** :
-- Module 1 → Opérateur 1 (toutes les solutions)
-- Module 2 → Opérateur 1 (toutes les solutions)
-- Module 3 → Opérateur 2 (toutes les solutions)
-- Module 4 → Opérateur 2 (toutes les solutions)
-
-**3 opérateurs** :
-- Module 1 → Opérateur 1 (toutes les solutions)
-- Module 2 → Opérateur 2 (toutes les solutions)
-- Module 3 → Opérateur 3 (toutes les solutions)
-- Module 4 → Partagé entre tous (solutions partagées pareillement entre les 3 opérateurs)
-  - Opérateur 1 : Solutions toutes
-  - Opérateur 2 : Solutions toutes
-  - Opérateur 3 : Solutions toutes
+**4 modules, 3 opérateurs** :
+- Module 1 → Opérateur 1, 2, 3 (toutes les solutions)
+- Module 2 → Opérateur 1, 2, 3 (toutes les solutions)
+- Module 3 → Opérateur 1, 2, 3 (toutes les solutions)
+- Module 4 → Opérateur 1, 2, 3 (toutes les solutions)
 
 ### 2. RANDOM_ONE_MODULE_SPLIT
 
