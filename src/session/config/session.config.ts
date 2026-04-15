@@ -1,6 +1,6 @@
 import { GameDifficulty, GameMode } from '../gameplay/types/gameplay.types';
 
-export const MAX_ANALYSTES_PER_SESSION = 1;
+export const MAX_ANALYSTES_PER_SESSION = 4;
 export const SESSION_CODE_LENGTH = 4;
 export const DEFAULT_GAME_DIFFICULTY: GameDifficulty = 'Medium';
 export const DEFAULT_GAME_MODE: GameMode = 'ONE_OPERATOR_ONE_MODULE';
