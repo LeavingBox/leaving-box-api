@@ -1,7 +1,7 @@
 import { ModuleEntity } from 'src/game/modules/module.schema';
 
-/** Format envoyé au frontend : index (1-based) + texte pour afficher "Solution 3" */
-export type SolutionWithIndex = { index: number; text: string };
+/** Format envoyé au frontend : index (1-based) + payload de solution (string ou objet riche) */
+export type SolutionWithIndex = { index: number; text: unknown };
 
 export type SolutionsDistribution = {
   moduleId: string;
@@ -19,5 +19,5 @@ export const getModuleId = (module: ModuleEntity): string => {
 };
 
 export const toSolutionsWithIndex = (
-  solutions: string[],
+  solutions: unknown[],
 ): SolutionWithIndex[] => solutions.map((text, i) => ({ index: i + 1, text }));

@@ -40,6 +40,7 @@ La configuration est centralisée dans `src/session/gameplay/config/difficulty.c
 - Les solutions de chaque module sont réparties en round-robin entre les opérateurs
 - Chaque opérateur reçoit une partie des solutions de chaque module
 - Sélection de module comme pour le mode 1
+- Exception module spécial : **Braille** n'est pas splitté, sa solution complète est envoyée à tous les opérateurs
 
 **Exemple** :
 - 3 opérateurs → tous les modules sélectionnés, solutions réparties en round-robin entre les 3 opérateurs
@@ -54,6 +55,10 @@ src/session/gameplay/
 │   └── gameplay.types.ts          # Types TypeScript (GameDifficulty, GameMode, etc.)
 ├── config/
 │   └── difficulty.config.ts       # Configuration des difficultés
+├── module-logic/
+│   ├── module-special-distribution.ts        # Registry/factory des logiques modules spéciales
+│   └── braille/
+│       └── braille-solution-distribution.ts  # Règle de distribution dédiée Braille
 ├── strategies/
 │   ├── module-selection.strategy.ts      # Stratégies de sélection de modules
 │   └── solution-distribution.strategy.ts # Stratégies de distribution de solutions
@@ -66,12 +71,34 @@ Le système utilise le pattern Strategy pour permettre l'ajout facile de nouveau
 
 1. **ModuleSelectionStrategy** : Détermine quels modules sont sélectionnés
 2. **SolutionDistributionStrategy** : Détermine comment les solutions sont réparties
+3. **Module special distribution** : surcharge la distribution pour des modules avec logique métier dédiée (ex: Braille)
 
 Pour ajouter un nouveau mode :
 1. Créer une nouvelle classe qui implémente `ModuleSelectionStrategy`
 2. Créer une nouvelle classe qui implémente `SolutionDistributionStrategy`
 3. Ajouter le nouveau mode dans `gameplay.types.ts`
 4. Mettre à jour les factories dans les fichiers de stratégies
+
+Pour ajouter un **module spécial** :
+1. Créer une logique dédiée dans `src/session/gameplay/module-logic/<module>/`
+2. Exposer une fonction `apply...Distribution(...)` qui retourne `true` si elle a traité le module
+3. Enregistrer cette fonction dans `module-special-distribution.ts`
+4. Laisser la stratégie générique traiter les autres modules
+
+## Indices supplémentaires (Agent)
+
+L'agent peut débloquer un indice sur un module actif de la session contre du temps.
+
+- Event de contexte : `getExtraHintContext` (modules disponibles, coût du prochain indice, limite)
+- Event d'action : `requestExtraHint` (module choisi + indice demandé)
+- Notifications :
+  - `extraHintGranted` (agent + room)
+  - `extraHintAlert` (analystes)
+
+Le coût et la limite dépendent de la difficulté (`difficulty.config.ts`) :
+- **Easy** : max 6, coût 5s puis +5s à chaque indice
+- **Medium** : max 4, coût 10s puis +10s
+- **Hard** : max 3, coût 15s puis +15s
 
 ## Utilisation
 

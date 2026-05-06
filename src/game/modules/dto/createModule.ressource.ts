@@ -15,4 +15,7 @@ export class CreateModuleDto {
 
   @ApiProperty({ type: [String], required: true })
   solutions: string[];
+
+  @ApiProperty({ type: [String], required: false, default: [] })
+  hints: string[];
 }

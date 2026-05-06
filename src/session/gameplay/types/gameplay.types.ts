@@ -5,6 +5,11 @@ export type GameMode = 'ONE_OPERATOR_ONE_MODULE' | 'RANDOM_ONE_MODULE_SPLIT';
 export type DifficultyConfig = {
   maxTime: number;
   label: string;
+  extraHint: {
+    maxHints: number;
+    baseCostSeconds: number;
+    incrementalCostSeconds: number;
+  };
 };
 
 export type GameplayConfig = {

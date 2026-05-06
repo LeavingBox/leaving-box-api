@@ -20,6 +20,10 @@ import {
   PLAYER_ROLES,
   TIMER_TICK_INTERVAL_MS,
 } from './config/session.config';
+import {
+  getDifficultyConfig,
+  getExtraHintCostForDifficulty,
+} from './gameplay/config/difficulty.config';
 
 @WebSocketGateway({
   cors: {
@@ -47,6 +51,10 @@ export class SessionsGateway implements OnGatewayDisconnect {
   // Objet pour stocker les intervalles de timer par session
   private readonly sessionTimers: { [sessionCode: string]: NodeJS.Timeout } =
     {};
+
+  private normalizeSessionCode(sessionCode: string): string {
+    return sessionCode.trim().toUpperCase();
+  }
 
   @SubscribeMessage('createSession')
   async handleCreateSession(
@@ -115,7 +123,8 @@ export class SessionsGateway implements OnGatewayDisconnect {
     @ConnectedSocket() client: Socket,
     @MessageBody() data: { sessionCode: string; currentPath?: string },
   ) {
-    const sessionData = await this.sessionService.getSession(data.sessionCode);
+    const sessionCode = this.normalizeSessionCode(data.sessionCode);
+    const sessionData = await this.sessionService.getSession(sessionCode);
 
     if (!sessionData) {
       return {
@@ -130,7 +139,7 @@ export class SessionsGateway implements OnGatewayDisconnect {
       if (player && player.role === PLAYER_ROLES.ANALYSTE) {
         // Enregistrer cette requête comme une action de navigation
         await this.sessionService.addOperatorAction(
-          data.sessionCode,
+          sessionCode,
           client.id,
           'getSession',
           { path: data.currentPath, timestamp: new Date() },
@@ -138,13 +147,13 @@ export class SessionsGateway implements OnGatewayDisconnect {
 
         // Détecter un retour en arrière
         const isBackNavigation = await this.sessionService.detectBackNavigation(
-          data.sessionCode,
+          sessionCode,
           client.id,
         );
 
         if (isBackNavigation) {
           const backNavData = {
-            sessionCode: data.sessionCode,
+            sessionCode,
             operatorId: client.id,
             operatorLabel: player.label,
             timestamp: new Date(),
@@ -162,15 +171,15 @@ export class SessionsGateway implements OnGatewayDisconnect {
       }
     }
 
-    const clients = await this.server.in(data.sessionCode).fetchSockets();
+    const clients = await this.server.in(sessionCode).fetchSockets();
     const clientsInfo = clients.map((socket) => ({
       id: socket.id,
       rooms: Array.from(socket.rooms),
     }));
 
-    if (client.rooms.has(data.sessionCode)) {
+    if (client.rooms.has(sessionCode)) {
       client.emit('currentSession', {
-        sessionCode: data.sessionCode,
+        sessionCode,
         sessionData,
         connectedClients: clientsInfo,
       });
@@ -184,25 +193,25 @@ export class SessionsGateway implements OnGatewayDisconnect {
     @MessageBody() data: { sessionCode: string; player: string },
     @ConnectedSocket() client: Socket,
   ) {
+    const sessionCode = this.normalizeSessionCode(data.sessionCode);
     let session: Session | null = null;
     try {
       session = await this.sessionService.addPlayerToSession(
-        data.sessionCode,
+        sessionCode,
         client.id,
         PLAYER_ROLES.ANALYSTE,
       );
     } catch (error) {
       if (error instanceof Error && error.message === 'MAX_ANALYSTES_REACHED') {
-        const currentSession = await this.sessionService.getSession(
-          data.sessionCode,
-        );
+        const currentSession =
+          await this.sessionService.getSession(sessionCode);
         const analysteCount =
           currentSession?.players.filter(
             (player) => player.role === PLAYER_ROLES.ANALYSTE,
           ).length ?? this.maxAnalystesPerSession;
         const sessionFullAlert = {
           message: `Limite atteinte: maximum ${this.maxAnalystesPerSession} analystes autorisés dans cette session.`,
-          sessionCode: data.sessionCode,
+          sessionCode,
           analysteCount,
           maxAnalystes: this.maxAnalystesPerSession,
           rejectedPlayerId: client.id,
@@ -253,7 +262,7 @@ export class SessionsGateway implements OnGatewayDisconnect {
         await client.leave(room);
       }
     }
-    await client.join(data.sessionCode);
+    await client.join(sessionCode);
 
     const player = session.players.find((p) => p.id === client.id);
     if (!player) {
@@ -263,7 +272,7 @@ export class SessionsGateway implements OnGatewayDisconnect {
       };
     }
 
-    this.server.to(data.sessionCode).emit('playerJoined', {
+    this.server.to(sessionCode).emit('playerJoined', {
       playerId: client.id,
       playerLabel: player.label,
       playerRole: player.role, // OBLIGATOIRE
@@ -278,9 +287,10 @@ export class SessionsGateway implements OnGatewayDisconnect {
     @MessageBody() data: { sessionCode: string; player: string },
     @ConnectedSocket() client: Socket,
   ) {
+    const sessionCode = this.normalizeSessionCode(data.sessionCode);
     // Gérer le retrait du joueur
     const removalResult = await this.handlePlayerRemoval(
-      data.sessionCode,
+      sessionCode,
       client.id,
     );
 
@@ -292,7 +302,7 @@ export class SessionsGateway implements OnGatewayDisconnect {
     }
 
     // Le client quitte la salle correspondant à la session
-    await client.leave(data.sessionCode);
+    await client.leave(sessionCode);
 
     // Si la session doit être fermée
     if (removalResult.shouldClose && removalResult.reason) {
@@ -301,7 +311,7 @@ export class SessionsGateway implements OnGatewayDisconnect {
     }
 
     // Informe tous les clients de la salle que le joueur a quitté
-    this.server.to(data.sessionCode).emit('playerLeft', {
+    this.server.to(sessionCode).emit('playerLeft', {
       playerId: client.id,
       session: removalResult.session,
     });
@@ -314,7 +324,8 @@ export class SessionsGateway implements OnGatewayDisconnect {
     @MessageBody() data: { sessionCode: string },
     @ConnectedSocket() client: Socket,
   ) {
-    const session = await this.sessionService.getSession(data.sessionCode);
+    const sessionCode = this.normalizeSessionCode(data.sessionCode);
+    const session = await this.sessionService.getSession(sessionCode);
     if (!session) {
       return {
         success: false,
@@ -329,7 +340,7 @@ export class SessionsGateway implements OnGatewayDisconnect {
     }
 
     const updatedSession =
-      (await this.sessionService.updateSession(data.sessionCode, {
+      (await this.sessionService.updateSession(sessionCode, {
         started: true,
       })) ?? session;
     const analystes = updatedSession.players.filter(
@@ -353,7 +364,7 @@ export class SessionsGateway implements OnGatewayDisconnect {
     }
     if (analystes.length > this.maxAnalystesPerSession) {
       this.logger.error('Lancement refusé: trop analystes dans la session', {
-        sessionCode: data.sessionCode,
+        sessionCode,
         analysteCount: analystes.length,
         maxAnalystes: this.maxAnalystesPerSession,
       });
@@ -377,15 +388,22 @@ export class SessionsGateway implements OnGatewayDisconnect {
         },
         analysteIds,
       );
+      const activeModuleIds = gameplayResult.solutionsDistribution.map(
+        (distribution) => distribution.moduleId,
+      );
+      const gameSession =
+        (await this.sessionService.updateSession(sessionCode, {
+          activeModuleIds,
+        })) ?? updatedSession;
 
-      this.server.to(data.sessionCode).emit('gameStarted', {
-        session: updatedSession,
+      this.server.to(sessionCode).emit('gameStarted', {
+        session: gameSession,
         moduleManuals: gameplayResult.moduleManuals,
         solutionsDistribution: gameplayResult.solutionsDistribution,
         solutionsByAnalyste: gameplayResult.solutionsByAnalyste,
       });
       this.logger.log('Partie lancée', {
-        sessionCode: data.sessionCode,
+        sessionCode,
         difficulty,
         gameMode,
         analysteCount: analystes.length,
@@ -445,7 +463,8 @@ export class SessionsGateway implements OnGatewayDisconnect {
     @MessageBody() data: { sessionCode: string },
     @ConnectedSocket() client: Socket,
   ) {
-    const session = await this.sessionService.getSession(data.sessionCode);
+    const sessionCode = this.normalizeSessionCode(data.sessionCode);
+    const session = await this.sessionService.getSession(sessionCode);
     if (!session) {
       return {
         success: false,
@@ -474,13 +493,11 @@ export class SessionsGateway implements OnGatewayDisconnect {
       };
     }
 
-    const updatedSession = await this.sessionService.startTimer(
-      data.sessionCode,
-    );
+    const updatedSession = await this.sessionService.startTimer(sessionCode);
     if (!updatedSession) {
       return { success: false, message: 'Failed to start timer' };
     }
-    this.startGameTimer(data.sessionCode, updatedSession);
+    this.startGameTimer(sessionCode, updatedSession);
     return { success: true };
   }
 
@@ -489,7 +506,8 @@ export class SessionsGateway implements OnGatewayDisconnect {
     @MessageBody() data: { sessionCode: string },
     @ConnectedSocket() client: Socket,
   ) {
-    const session = await this.sessionService.getSession(data.sessionCode);
+    const sessionCode = this.normalizeSessionCode(data.sessionCode);
+    const session = await this.sessionService.getSession(sessionCode);
     if (!session) {
       return {
         success: false,
@@ -503,7 +521,259 @@ export class SessionsGateway implements OnGatewayDisconnect {
       };
     }
 
-    await this.stopGameTimer(data.sessionCode);
+    await this.stopGameTimer(sessionCode);
+    return { success: true };
+  }
+
+  @SubscribeMessage('requestExtraHint')
+  async handleRequestExtraHint(
+    @MessageBody()
+    data: {
+      sessionCode: string;
+      moduleId: string;
+      hintIndex?: number;
+    },
+    @ConnectedSocket() client: Socket,
+  ) {
+    const session = await this.sessionService.getSession(data.sessionCode);
+    if (!session) {
+      return {
+        success: false,
+        message: `Session with code ${data.sessionCode} does not exist`,
+      };
+    }
+    if (session.agentId !== client.id) {
+      return {
+        success: false,
+        message: 'Only the agent can request an extra hint',
+      };
+    }
+    if (!session.started || !session.timerStarted) {
+      return {
+        success: false,
+        message: 'Game timer must be running to request an extra hint',
+      };
+    }
+    if (!data.moduleId) {
+      return {
+        success: false,
+        message: 'moduleId is required',
+      };
+    }
+
+    const moduleEntity =
+      (await this.moduleService.findOne(data.moduleId)) ??
+      (await this.moduleService.findOneByName(data.moduleId));
+    if (!moduleEntity) {
+      return {
+        success: false,
+        message: `Module ${data.moduleId} not found`,
+      };
+    }
+    const rawActiveModuleIds: unknown = (
+      session as Session & { activeModuleIds?: unknown }
+    ).activeModuleIds;
+    const activeModuleIds = Array.isArray(rawActiveModuleIds)
+      ? rawActiveModuleIds.filter(
+          (moduleId): moduleId is string => typeof moduleId === 'string',
+        )
+      : [];
+    const hasModuleInCurrentGame =
+      activeModuleIds.includes(data.moduleId) ||
+      activeModuleIds.includes(moduleEntity.name);
+    if (!hasModuleInCurrentGame) {
+      return {
+        success: false,
+        message: `Module ${data.moduleId} is not active in this session`,
+      };
+    }
+    const modulePosition = activeModuleIds.findIndex(
+      (moduleId) =>
+        moduleId === data.moduleId || moduleId === moduleEntity.name,
+    );
+    const moduleNumber = modulePosition >= 0 ? modulePosition + 1 : null;
+
+    // Use dedicated hints array; fallback to solutions for backwards compat
+    const hintPool: unknown[] =
+      Array.isArray(moduleEntity.hints) && moduleEntity.hints.length > 0
+        ? moduleEntity.hints
+        : (moduleEntity.solutions ?? []);
+
+    if (hintPool.length === 0) {
+      return {
+        success: false,
+        message: 'No hint available for this module',
+      };
+    }
+
+    const moduleHintsState = session.moduleHintsState ?? {};
+    const hintsUsedForModule = moduleHintsState[data.moduleId] ?? 0;
+
+    // Allow explicit hintIndex override, otherwise auto-increment per module
+    const requestedHintIndex =
+      data.hintIndex != null
+        ? Math.max(1, data.hintIndex)
+        : hintsUsedForModule + 1;
+
+    if (requestedHintIndex > hintPool.length) {
+      return {
+        success: false,
+        message: `All hints already unlocked for this module (${hintPool.length} total)`,
+      };
+    }
+
+    const nextHintNumber = session.extraHintsUsed + 1;
+    const difficultyConfig = getDifficultyConfig(session.difficulty);
+    const maxHintsForDifficulty = difficultyConfig.extraHint.maxHints;
+    if (nextHintNumber > maxHintsForDifficulty) {
+      return {
+        success: false,
+        message: `Extra hint limit reached for ${session.difficulty} (${maxHintsForDifficulty} max)`,
+      };
+    }
+
+    const timeCostSeconds = getExtraHintCostForDifficulty(
+      session.difficulty,
+      nextHintNumber,
+    );
+    const remainingTime = Math.max(0, session.remainingTime - timeCostSeconds);
+
+    const updatedModuleHintsState = {
+      ...moduleHintsState,
+      [data.moduleId]: Math.max(hintsUsedForModule + 1, requestedHintIndex),
+    };
+
+    await this.sessionService.updateTimer(data.sessionCode, remainingTime);
+    const updatedSession = await this.sessionService.updateSession(
+      data.sessionCode,
+      {
+        extraHintsUsed: nextHintNumber,
+        moduleHintsState: updatedModuleHintsState,
+      },
+    );
+    this.server
+      .to(data.sessionCode)
+      .emit('timerUpdate', { remaining: remainingTime });
+
+    const extraHintPayload = {
+      sessionCode: data.sessionCode,
+      moduleId: data.moduleId,
+      moduleNumber,
+      moduleName: moduleEntity.name,
+      message: `Indice supplémentaire débloqué pour ${moduleEntity.name}`,
+      hintIndex: requestedHintIndex,
+      hintText: hintPool[requestedHintIndex - 1],
+      hintsUsedForModule: updatedModuleHintsState[data.moduleId],
+      totalHintsInModule: hintPool.length,
+      hintNumber: nextHintNumber,
+      maxHintsForDifficulty,
+      timeCostSeconds,
+      remainingTime,
+      difficulty: session.difficulty,
+      extraHintsUsed: updatedSession?.extraHintsUsed ?? nextHintNumber,
+      requestedBy: client.id,
+      timestamp: new Date(),
+    };
+    this.server.to(data.sessionCode).emit('extraHintGranted', extraHintPayload);
+    // Alerte ciblée pour les analystes: un indice a été débloqué par l'agent.
+    const analysteIds = session.players
+      .filter((player) => player.role === PLAYER_ROLES.ANALYSTE)
+      .map((player) => player.id);
+    analysteIds.forEach((analysteId) => {
+      this.server.to(analysteId).emit('extraHintAlert', {
+        ...extraHintPayload,
+        message: `Indice supplémentaire débloqué pour ${moduleEntity.name}`,
+      });
+    });
+
+    if (remainingTime <= 0) {
+      await this.stopGameTimer(data.sessionCode);
+      const gameResult: GameResult = GAME_RESULTS.LOSE;
+      this.server.to(data.sessionCode).emit('gameOver', {
+        message: 'Le temps est écoulé !',
+        sessionCode: data.sessionCode,
+        difficulty: session.difficulty,
+        gameResult,
+      });
+      await this.sessionService.updateSession(data.sessionCode, { gameResult });
+    }
+
+    return { success: true, extraHint: extraHintPayload };
+  }
+
+  @SubscribeMessage('getExtraHintContext')
+  async handleGetExtraHintContext(
+    @MessageBody() data: { sessionCode: string },
+    @ConnectedSocket() client: Socket,
+  ) {
+    const session = await this.sessionService.getSession(data.sessionCode);
+    if (!session) {
+      return {
+        success: false,
+        message: `Session with code ${data.sessionCode} does not exist`,
+      };
+    }
+    if (session.agentId !== client.id) {
+      return {
+        success: false,
+        message: 'Only the agent can request extra hint context',
+      };
+    }
+
+    const difficultyConfig = getDifficultyConfig(session.difficulty);
+    const nextHintNumber = session.extraHintsUsed + 1;
+    const nextHintCostSeconds = getExtraHintCostForDifficulty(
+      session.difficulty,
+      nextHintNumber,
+    );
+    const rawActiveModuleIds: unknown = (
+      session as Session & { activeModuleIds?: unknown }
+    ).activeModuleIds;
+    const activeModuleIds = Array.isArray(rawActiveModuleIds)
+      ? rawActiveModuleIds.filter(
+          (moduleId): moduleId is string => typeof moduleId === 'string',
+        )
+      : [];
+    const moduleHintsState = session.moduleHintsState ?? {};
+    const availableModules: Array<{
+      moduleId: string;
+      moduleNumber: number;
+      moduleName: string;
+      hintsUsed: number;
+      totalHints: number;
+      hintsRemaining: number;
+    }> = [];
+    for (const [index, moduleId] of activeModuleIds.entries()) {
+      const moduleEntity =
+        (await this.moduleService.findOne(moduleId)) ??
+        (await this.moduleService.findOneByName(moduleId));
+      const hintPool =
+        Array.isArray(moduleEntity?.hints) &&
+        (moduleEntity?.hints.length ?? 0) > 0
+          ? (moduleEntity?.hints ?? [])
+          : (moduleEntity?.solutions ?? []);
+      const hintsUsed = moduleHintsState[moduleId] ?? 0;
+      availableModules.push({
+        moduleId,
+        moduleNumber: index + 1,
+        moduleName: moduleEntity?.name ?? moduleId,
+        hintsUsed,
+        totalHints: hintPool.length,
+        hintsRemaining: Math.max(0, hintPool.length - hintsUsed),
+      });
+    }
+
+    client.emit('extraHintContext', {
+      sessionCode: data.sessionCode,
+      difficulty: session.difficulty,
+      extraHintsUsed: session.extraHintsUsed,
+      maxHintsForDifficulty: difficultyConfig.extraHint.maxHints,
+      nextHintNumber,
+      nextHintCostSeconds,
+      moduleHintsState,
+      availableModules,
+    });
+
     return { success: true };
   }
 
@@ -797,7 +1067,7 @@ export class SessionsGateway implements OnGatewayDisconnect {
   }
 
   startGameTimer(sessionCode: string, session: Session) {
-    let remaining = session.maxTime;
+    let remaining = session.remainingTime;
 
     // Envoi immédiat pour synchroniser les clients qui viennent juste d'entrer.
     this.server.to(sessionCode).emit('timerUpdate', { remaining });
@@ -817,7 +1087,15 @@ export class SessionsGateway implements OnGatewayDisconnect {
         return;
       }
 
-      remaining -= 1;
+      // Synchroniser avec l'état persistant pour prendre en compte
+      // les ajustements externes (ex: indice supplémentaire).
+      const currentSession = await this.sessionService.getSession(sessionCode);
+      if (!currentSession) {
+        clearInterval(interval);
+        delete this.sessionTimers[sessionCode];
+        return;
+      }
+      remaining = currentSession.remainingTime - 1;
 
       // L'état Redis est mis à jour avant l'emit pour que les reconnexions
       // lisent la valeur la plus récente via getSession.

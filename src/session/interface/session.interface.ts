@@ -27,6 +27,10 @@ export type Session = {
   createdAt: Date;
   players: Player[];
   started: boolean;
+  extraHintsUsed: number;
+  /** Number of hints already unlocked per module: { [moduleId]: count } */
+  moduleHintsState: Record<string, number>;
+  activeModuleIds: string[];
   operatorActions?: OperatorAction[];
   difficulty: GameDifficulty;
   gameMode: GameMode;
