@@ -29,6 +29,10 @@ export class SessionService {
 
   constructor(private readonly redisService: RedisService) {}
 
+  private normalizeSessionCode(sessionCode: string): string {
+    return sessionCode.trim().toUpperCase();
+  }
+
   async createSession({
     difficulty,
     gameMode,
@@ -54,6 +58,7 @@ export class SessionService {
       players: [agentPlayer],
       started: false,
       extraHintsUsed: 0,
+      moduleHintsState: {},
       activeModuleIds: [],
       operatorActions: [],
       difficulty,
@@ -68,7 +73,10 @@ export class SessionService {
   }
 
   async getSession(sessionCode: string): Promise<Session | null> {
-    const sessionData = await this.redisService.get(`session:${sessionCode}`);
+    const normalizedSessionCode = this.normalizeSessionCode(sessionCode);
+    const sessionData = await this.redisService.get(
+      `session:${normalizedSessionCode}`,
+    );
     if (!sessionData) {
       return null;
     }
@@ -86,6 +94,12 @@ export class SessionService {
     if (!Array.isArray(session.activeModuleIds)) {
       session.activeModuleIds = [];
     }
+    if (
+      !session.moduleHintsState ||
+      typeof session.moduleHintsState !== 'object'
+    ) {
+      session.moduleHintsState = {};
+    }
     return session;
   }
 
@@ -93,12 +107,13 @@ export class SessionService {
     sessionCode: string,
     updatedData: Partial<Session>,
   ): Promise<Session | null> {
-    const session = await this.getSession(sessionCode);
+    const normalizedSessionCode = this.normalizeSessionCode(sessionCode);
+    const session = await this.getSession(normalizedSessionCode);
     if (session) {
       // Merge shallow volontaire: les payloads d'update remplacent les branches ciblées.
       const newSession = { ...session, ...updatedData };
       await this.redisService.set(
-        `session:${sessionCode}`,
+        `session:${normalizedSessionCode}`,
         JSON.stringify(newSession),
       );
       return newSession;
@@ -110,7 +125,10 @@ export class SessionService {
     sessionCode: string,
     difficulty?: Session['difficulty'],
   ): Promise<string> {
-    const deletedCount = await this.redisService.del(`session:${sessionCode}`);
+    const normalizedSessionCode = this.normalizeSessionCode(sessionCode);
+    const deletedCount = await this.redisService.del(
+      `session:${normalizedSessionCode}`,
+    );
     if (deletedCount === 1) {
       const diffPart = difficulty ? ` (difficulty: ${difficulty})` : '';
       this.logger.log(
@@ -122,7 +140,7 @@ export class SessionService {
         `Session non trouvée (déjà supprimée?): ${sessionCode}${diffPart}`,
       );
     }
-    return sessionCode;
+    return normalizedSessionCode;
   }
 
   // PLAYER MANAGEMENT
@@ -131,7 +149,8 @@ export class SessionService {
     playerId: string,
     role: PlayerRole,
   ): Promise<Session | null> {
-    const session = await this.getSession(sessionCode);
+    const normalizedSessionCode = this.normalizeSessionCode(sessionCode);
+    const session = await this.getSession(normalizedSessionCode);
     if (!session) {
       return null;
     }
@@ -161,7 +180,7 @@ export class SessionService {
         : createAnalystePlayer(playerId, session.players);
 
     session.players.push(player);
-    await this.updateSession(sessionCode, session);
+    await this.updateSession(normalizedSessionCode, session);
     if (role === PLAYER_ROLES.ANALYSTE) {
       const analysteCount = session.players.filter(
         (currentPlayer) => currentPlayer.role === PLAYER_ROLES.ANALYSTE,
@@ -180,18 +199,20 @@ export class SessionService {
     sessionCode: string,
     playerId: string,
   ): Promise<Session | null> {
-    const session = await this.getSession(sessionCode);
+    const normalizedSessionCode = this.normalizeSessionCode(sessionCode);
+    const session = await this.getSession(normalizedSessionCode);
     if (!session) {
       return null;
     }
     session.players = session.players.filter((p) => p.id !== playerId);
-    await this.updateSession(sessionCode, session);
+    await this.updateSession(normalizedSessionCode, session);
     return session;
   }
 
   //TIMER
   async startTimer(sessionCode: string): Promise<Session | null> {
-    const session = await this.getSession(sessionCode);
+    const normalizedSessionCode = this.normalizeSessionCode(sessionCode);
+    const session = await this.getSession(normalizedSessionCode);
     if (!session) {
       return null;
     }
@@ -200,7 +221,7 @@ export class SessionService {
     }
 
     session.timerStarted = true;
-    await this.updateSession(sessionCode, session);
+    await this.updateSession(normalizedSessionCode, session);
     return session;
   }
 
@@ -208,7 +229,8 @@ export class SessionService {
     sessionCode: string,
     remaining: number,
   ): Promise<Session | null> {
-    const session = await this.getSession(sessionCode);
+    const normalizedSessionCode = this.normalizeSessionCode(sessionCode);
+    const session = await this.getSession(normalizedSessionCode);
     if (!session) {
       return null;
     }
@@ -218,11 +240,11 @@ export class SessionService {
     if (remaining <= 0) {
       session.timerStarted = false;
       session.remainingTime = 0;
-      await this.updateSession(sessionCode, session);
+      await this.updateSession(normalizedSessionCode, session);
       return null;
     }
     session.remainingTime = remaining;
-    await this.updateSession(sessionCode, session);
+    await this.updateSession(normalizedSessionCode, session);
     return session;
   }
 
@@ -233,7 +255,8 @@ export class SessionService {
     action: string,
     data?: Record<string, unknown>,
   ): Promise<Session | null> {
-    const session = await this.getSession(sessionCode);
+    const normalizedSessionCode = this.normalizeSessionCode(sessionCode);
+    const session = await this.getSession(normalizedSessionCode);
     if (!session) {
       return null;
     }
@@ -259,7 +282,7 @@ export class SessionService {
       );
     }
 
-    await this.updateSession(sessionCode, session);
+    await this.updateSession(normalizedSessionCode, session);
     return session;
   }
 
@@ -267,7 +290,8 @@ export class SessionService {
     sessionCode: string,
     operatorId?: string,
   ): Promise<OperatorAction[]> {
-    const session = await this.getSession(sessionCode);
+    const normalizedSessionCode = this.normalizeSessionCode(sessionCode);
+    const session = await this.getSession(normalizedSessionCode);
     if (!session || !session.operatorActions) {
       return [];
     }
@@ -286,7 +310,11 @@ export class SessionService {
     sessionCode: string,
     operatorId: string,
   ): Promise<boolean> {
-    const actions = await this.getOperatorActions(sessionCode, operatorId);
+    const normalizedSessionCode = this.normalizeSessionCode(sessionCode);
+    const actions = await this.getOperatorActions(
+      normalizedSessionCode,
+      operatorId,
+    );
     if (actions.length < 2) return false;
 
     const last = actions[actions.length - 1];

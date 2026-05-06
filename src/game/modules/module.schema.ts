@@ -14,8 +14,13 @@ export class ModuleEntity {
   @Prop({ type: String, required: false })
   imgUrl?: string;
 
-  @Prop({ type: [String], required: true })
-  solutions: string[];
+  /** Clues/steps distributed to analystes during the game */
+  @Prop({ type: [Object], required: true })
+  solutions: unknown[];
+
+  /** Extra hints the agent can unlock (costs time). Separate from solutions. */
+  @Prop({ type: [String], required: false, default: [] })
+  hints: string[];
 }
 
 export const ModuleSchema = SchemaFactory.createForClass(ModuleEntity);

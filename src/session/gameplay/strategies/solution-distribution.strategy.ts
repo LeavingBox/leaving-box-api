@@ -6,6 +6,7 @@ import {
   getModuleId,
   toSolutionsWithIndex,
 } from 'src/session/utils/solutions-distribution';
+import { applyModuleSpecialDistribution } from '../module-logic/module-special-distribution';
 import { GameMode } from '../types/gameplay.types';
 
 export type DistributionResult = {
@@ -48,9 +49,7 @@ const assignModuleToAll = (
 };
 
 /** Mode standard: chaque analyste reçoit tous les modules avec toutes les solutions. */
-export class OneOperatorOneModuleDistributionStrategy
-  implements SolutionDistributionStrategy
-{
+export class OneOperatorOneModuleDistributionStrategy implements SolutionDistributionStrategy {
   distribute(
     modules: ModuleEntity[],
     recipientIds: string[],
@@ -66,9 +65,7 @@ export class OneOperatorOneModuleDistributionStrategy
 }
 
 /** Solutions réparties en round-robin entre analystes */
-export class RandomOneModuleSplitDistributionStrategy
-  implements SolutionDistributionStrategy
-{
+export class RandomOneModuleSplitDistributionStrategy implements SolutionDistributionStrategy {
   distribute(
     modules: ModuleEntity[],
     recipientIds: string[],
@@ -77,11 +74,14 @@ export class RandomOneModuleSplitDistributionStrategy
     if (modules.length === 0) return result;
 
     modules.forEach((module) => {
-      const moduleId = getModuleId(module);
       const steps = module.solutions ?? [];
       const allocations: Record<string, SolutionWithIndex[]> = {};
 
       recipientIds.forEach((id) => (allocations[id] = []));
+
+      if (applyModuleSpecialDistribution(module, recipientIds, result)) return;
+
+      const moduleId = getModuleId(module);
       steps.forEach((step, idx) => {
         const target = recipientIds[idx % recipientIds.length];
         allocations[target].push({ index: idx + 1, text: step });
